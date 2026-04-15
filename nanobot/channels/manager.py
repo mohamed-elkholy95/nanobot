@@ -32,6 +32,7 @@ class ChannelManager:
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._active_streams: set[str] = set()
 
         self._init_channels()
 
@@ -116,14 +117,16 @@ class ChannelManager:
         target = self.channels.get(notice.channel)
         if not target:
             return
-        asyncio.create_task(self._send_with_retry(
-            target,
-            OutboundMessage(
-                channel=notice.channel,
-                chat_id=notice.chat_id,
-                content=format_restart_completed_message(notice.started_at_raw),
-            ),
-        ))
+        asyncio.create_task(
+            self._send_with_retry(
+                target,
+                OutboundMessage(
+                    channel=notice.channel,
+                    chat_id=notice.chat_id,
+                    content=format_restart_completed_message(notice.started_at_raw),
+                ),
+            )
+        )
 
     async def stop_all(self) -> None:
         """Stop all channels and the dispatcher."""
@@ -159,22 +162,34 @@ class ChannelManager:
                 if pending:
                     msg = pending.pop(0)
                 else:
-                    msg = await asyncio.wait_for(
-                        self.bus.consume_outbound(),
-                        timeout=1.0
-                    )
+                    msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
 
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
                         continue
-                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                    if (
+                        not msg.metadata.get("_tool_hint")
+                        and not self.config.channels.send_progress
+                    ):
                         continue
 
-                # Coalesce consecutive _stream_delta messages for the same (channel, chat_id)
-                # to reduce API calls and improve streaming latency
+                # Coalesce consecutive _stream_delta messages for the same (channel, chat_id).
+                # First delta for a stream is dispatched immediately (no coalescing) so the
+                # user sees output without waiting for the batching window to fill.
                 if msg.metadata.get("_stream_delta") and not msg.metadata.get("_stream_end"):
-                    msg, extra_pending = self._coalesce_stream_deltas(msg)
-                    pending.extend(extra_pending)
+                    stream_key = msg.metadata.get("_stream_id") or f"{msg.channel}:{msg.chat_id}"
+                    if stream_key not in self._active_streams:
+                        # First delta for this stream — dispatch immediately, skip coalescing
+                        self._active_streams.add(stream_key)
+                    else:
+                        # Subsequent deltas — coalesce as before
+                        msg, extra_pending = self._coalesce_stream_deltas(msg)
+                        pending.extend(extra_pending)
+
+                # Clean up stream tracking when the stream ends
+                if msg.metadata.get("_stream_end"):
+                    stream_key = msg.metadata.get("_stream_id") or f"{msg.channel}:{msg.chat_id}"
+                    self._active_streams.discard(stream_key)
 
                 channel = self.channels.get(msg.channel)
                 if channel:
@@ -206,13 +221,15 @@ class ChannelManager:
         Returns:
             tuple of (merged_message, list_of_non_matching_messages)
         """
-        target_key = (first_msg.channel, first_msg.chat_id)
+        first_stream_id = (first_msg.metadata or {}).get("_stream_id")
+        target_key = (first_msg.channel, first_msg.chat_id, first_stream_id)
         combined_content = first_msg.content
         final_metadata = dict(first_msg.metadata or {})
         non_matching: list[OutboundMessage] = []
 
-        # Only merge consecutive deltas. As soon as we hit any other message,
-        # stop and hand that boundary back to the dispatcher via `pending`.
+        # Only merge consecutive deltas for the same (channel, chat_id, _stream_id).
+        # As soon as we hit any other message, stop and hand that boundary back
+        # to the dispatcher via `pending`.
         while True:
             try:
                 next_msg = self.bus.outbound.get_nowait()
@@ -220,9 +237,11 @@ class ChannelManager:
                 break
 
             # Check if this message belongs to the same stream
-            same_target = (next_msg.channel, next_msg.chat_id) == target_key
-            is_delta = next_msg.metadata and next_msg.metadata.get("_stream_delta")
-            is_end = next_msg.metadata and next_msg.metadata.get("_stream_end")
+            next_meta = next_msg.metadata or {}
+            next_stream_id = next_meta.get("_stream_id")
+            same_target = (next_msg.channel, next_msg.chat_id, next_stream_id) == target_key
+            is_delta = next_meta.get("_stream_delta")
+            is_end = next_meta.get("_stream_end")
 
             if same_target and is_delta and not final_metadata.get("_stream_end"):
                 # Accumulate content
@@ -262,13 +281,20 @@ class ChannelManager:
                 if attempt == max_attempts - 1:
                     logger.error(
                         "Failed to send to {} after {} attempts: {} - {}",
-                        msg.channel, max_attempts, type(e).__name__, e
+                        msg.channel,
+                        max_attempts,
+                        type(e).__name__,
+                        e,
                     )
                     return
                 delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
                 logger.warning(
                     "Send to {} failed (attempt {}/{}): {}, retrying in {}s",
-                    msg.channel, attempt + 1, max_attempts, type(e).__name__, delay
+                    msg.channel,
+                    attempt + 1,
+                    max_attempts,
+                    type(e).__name__,
+                    delay,
                 )
                 try:
                     await asyncio.sleep(delay)
@@ -282,10 +308,7 @@ class ChannelManager:
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {
-            name: {
-                "enabled": True,
-                "running": channel.is_running
-            }
+            name: {"enabled": True, "running": channel.is_running}
             for name, channel in self.channels.items()
         }
 
