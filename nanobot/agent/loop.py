@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import json
 import os
@@ -23,10 +24,12 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.self import SelfTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -87,6 +90,9 @@ class _LoopHook(AgentHook):
         if self._on_stream_end:
             await self._on_stream_end(resuming=resuming)
         self._stream_buf = ""
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        self._loop._watchdog_check()
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         if self._on_progress:
@@ -154,6 +160,8 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
+        self_evolution: bool = True,
+        self_modify: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -240,6 +248,17 @@ class AgentLoop:
             model=self.model,
         )
         self._register_default_tools()
+        self._config_dirty = False
+        if self_evolution:
+            self.tools.register(SelfTool(loop=self, modify_allowed=self_modify))
+        self._config_defaults: dict[str, Any] = {
+            "max_iterations": self.max_iterations,
+            "context_window_tokens": self.context_window_tokens,
+            "model": self.model,
+        }
+        self._runtime_vars: dict[str, Any] = {}
+        if self_evolution:
+            self._backup_critical_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
@@ -304,9 +323,43 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
+    def _backup_critical_tools(self) -> None:
+        """Create immutable backups of tools that must never be missing."""
+        self._critical_tool_backup: dict[str, Tool] = {}
+        for name in ("self", "message", "read_file"):
+            tool = self.tools.get(name)
+            if tool:
+                try:
+                    self._critical_tool_backup[name] = copy.deepcopy(tool)
+                except Exception as e:
+                    logger.warning("Cannot deepcopy tool '{}': {}", name, e)
+                    self._critical_tool_backup[name] = tool
+
+    def _watchdog_check(self) -> None:
+        """Detect and correct dangerous runtime states at the start of each iteration."""
+        if not self._config_dirty:
+            return
+        defaults = self._config_defaults
+        if not (1 <= self.max_iterations <= 100):
+            logger.warning("Watchdog: resetting max_iterations {} -> {}", self.max_iterations, defaults["max_iterations"])
+            self.max_iterations = defaults["max_iterations"]
+        if not (4096 <= self.context_window_tokens <= 1_000_000):
+            logger.warning("Watchdog: resetting context_window_tokens {} -> {}", self.context_window_tokens, defaults["context_window_tokens"])
+            self.context_window_tokens = defaults["context_window_tokens"]
+        # Validate model is a non-empty string
+        if not self.model or not isinstance(self.model, str) or not self.model.strip():
+            logger.warning("Watchdog: resetting model {} -> {}", self.model, defaults["model"])
+            self.model = defaults["model"]
+        # Restore critical tools if they were somehow removed
+        for name, backup in self._critical_tool_backup.items():
+            if not self.tools.has(name):
+                logger.warning("Watchdog: restoring critical tool '{}'", name)
+                self.tools.register(copy.deepcopy(backup))
+        self._config_dirty = False
+
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "self"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
@@ -420,6 +473,11 @@ class AgentLoop:
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
+            # Push final content through stream so streaming channels (e.g. Feishu)
+            # update the card instead of leaving it empty.
+            if on_stream and on_stream_end:
+                await on_stream(result.final_content or "")
+                await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
