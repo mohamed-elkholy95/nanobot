@@ -164,6 +164,7 @@ class OpenAICompatProvider(LLMProvider):
             default_headers=default_headers,
             max_retries=0,
         )
+        self._responses_api_failures: dict[tuple[str, str | None], int] = {}
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
         """Set environment variables based on provider spec."""
@@ -355,6 +356,22 @@ class OpenAICompatProvider(LLMProvider):
         if reasoning_effort and reasoning_effort.lower() != "none":
             return True
         return any(token in model_name for token in ("gpt-5", "o1", "o3", "o4"))
+
+    @staticmethod
+    def _responses_failure_key(model: str | None, reasoning_effort: str | None) -> tuple[str, str | None]:
+        return (model or "", reasoning_effort)
+
+    def _should_skip_responses_api(self, model: str | None, reasoning_effort: str | None) -> bool:
+        key = self._responses_failure_key(model, reasoning_effort)
+        return self._responses_api_failures.get(key, 0) >= 3
+
+    def _record_responses_api_failure(self, model: str | None, reasoning_effort: str | None) -> None:
+        key = self._responses_failure_key(model, reasoning_effort)
+        self._responses_api_failures[key] = self._responses_api_failures.get(key, 0) + 1
+
+    def _record_responses_api_success(self, model: str | None, reasoning_effort: str | None) -> None:
+        key = self._responses_failure_key(model, reasoning_effort)
+        self._responses_api_failures[key] = 0
 
     @staticmethod
     def _should_fallback_from_responses_error(e: Exception) -> bool:
@@ -847,16 +864,19 @@ class OpenAICompatProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         try:
-            if self._should_use_responses_api(model, reasoning_effort):
+            if self._should_use_responses_api(model, reasoning_effort) and not self._should_skip_responses_api(model, reasoning_effort):
                 try:
                     body = self._build_responses_body(
                         messages, tools, model, max_tokens, temperature,
                         reasoning_effort, tool_choice,
                     )
-                    return parse_response_output(await self._client.responses.create(**body))
+                    result = parse_response_output(await self._client.responses.create(**body))
+                    self._record_responses_api_success(model, reasoning_effort)
+                    return result
                 except Exception as responses_error:
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
+                    self._record_responses_api_failure(model, reasoning_effort)
 
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
