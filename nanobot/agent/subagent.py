@@ -208,7 +208,17 @@ class SubagentManager:
             content=announce_content,
         )
 
-        await self.bus.publish_inbound(msg)
+        if not await self.bus.publish_inbound(msg):
+            logger.warning(
+                "Subagent [{}] result announce failed (bus full), retrying",
+                task_id,
+            )
+            await asyncio.sleep(2.0)
+            if not await self.bus.publish_inbound(msg):
+                logger.error(
+                    "Subagent [{}] result lost after retry (bus full)", task_id,
+                )
+                return
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
 
     @staticmethod
