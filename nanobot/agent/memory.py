@@ -263,14 +263,13 @@ class MemoryStore:
         """Return history entries with cursor > *since_cursor*.
 
         Uses a cached byte offset for incremental reads when the caller
-        advances to a *new* cursor that is greater than the previous call's
-        cursor.  When the same cursor is re-requested (e.g. context.py
-        rebuilding Recent History each turn with the same dream cursor),
-        a full scan is performed to guarantee all matching entries are
-        returned.
+        asks for entries that can only come from new appends (i.e.
+        since_cursor >= the highest cursor seen in the previous read).
+        Otherwise falls back to a full scan.
         """
         if (
-            since_cursor > self._cached_since_cursor
+            since_cursor >= self._cached_since_cursor
+            and self._cached_since_cursor >= 0
             and self._cursor_byte_offset > 0
             and self.history_file.exists()
         ):
@@ -279,11 +278,21 @@ class MemoryStore:
             entries = [e for e in self._read_entries() if e["cursor"] > since_cursor]
         if self.history_file.exists():
             self._cursor_byte_offset = self.history_file.stat().st_size
-        self._cached_since_cursor = since_cursor
+        # Track the highest cursor value seen, not the since_cursor argument.
+        # This tells us which entries are already on disk and don't need rescanning.
+        all_entries_with_pending = entries  # pending added below
+        max_cursor = since_cursor
+        for e in entries:
+            c = e.get("cursor", 0)
+            if c > max_cursor:
+                max_cursor = c
         # Include buffered entries not yet flushed to disk.
         for e in self._pending_entries:
             if e["cursor"] > since_cursor:
                 entries.append(e)
+                if e["cursor"] > max_cursor:
+                    max_cursor = e["cursor"]
+        self._cached_since_cursor = max_cursor
         return entries
 
     def compact_history(self) -> None:

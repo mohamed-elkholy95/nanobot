@@ -188,9 +188,9 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = list(hooks or [])
-        # Register ProfilingHook if profiling is enabled via config or env
+        # Register ProfilingHook if NANOBOT_PROFILING env var is set
         from nanobot.agent.profiling import ProfilingHook, is_profiling_enabled
-        if is_profiling_enabled(defaults):
+        if is_profiling_enabled():
             self._extra_hooks.append(ProfilingHook())
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)

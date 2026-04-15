@@ -220,13 +220,15 @@ class ChannelManager:
         Returns:
             tuple of (merged_message, list_of_non_matching_messages)
         """
-        target_key = (first_msg.channel, first_msg.chat_id)
+        first_stream_id = (first_msg.metadata or {}).get("_stream_id")
+        target_key = (first_msg.channel, first_msg.chat_id, first_stream_id)
         combined_content = first_msg.content
         final_metadata = dict(first_msg.metadata or {})
         non_matching: list[OutboundMessage] = []
 
-        # Only merge consecutive deltas. As soon as we hit any other message,
-        # stop and hand that boundary back to the dispatcher via `pending`.
+        # Only merge consecutive deltas for the same (channel, chat_id, _stream_id).
+        # As soon as we hit any other message, stop and hand that boundary back
+        # to the dispatcher via `pending`.
         while True:
             try:
                 next_msg = self.bus.outbound.get_nowait()
@@ -234,9 +236,11 @@ class ChannelManager:
                 break
 
             # Check if this message belongs to the same stream
-            same_target = (next_msg.channel, next_msg.chat_id) == target_key
-            is_delta = next_msg.metadata and next_msg.metadata.get("_stream_delta")
-            is_end = next_msg.metadata and next_msg.metadata.get("_stream_end")
+            next_meta = next_msg.metadata or {}
+            next_stream_id = next_meta.get("_stream_id")
+            same_target = (next_msg.channel, next_msg.chat_id, next_stream_id) == target_key
+            is_delta = next_meta.get("_stream_delta")
+            is_end = next_meta.get("_stream_end")
 
             if same_target and is_delta and not final_metadata.get("_stream_end"):
                 # Accumulate content
