@@ -611,7 +611,9 @@ class Consolidator:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
             self.store.raw_archive(messages)
             self.store.flush_history()
-            return None
+            # Return a non-None value so the caller advances last_consolidated
+            # and doesn't re-process these messages on the next turn.
+            return f"[RAW] {len(messages)} messages archived"
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
         """Loop: archive old messages until prompt fits within safe budget.

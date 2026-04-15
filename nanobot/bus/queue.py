@@ -53,18 +53,13 @@ class MessageBus:
     async def publish_outbound(self, msg: OutboundMessage) -> bool:
         """Publish a response from the agent to channels.
 
-        Returns True on success, False if the queue is full after timeout.
+        Blocks until space is available. Agent replies must never be
+        silently dropped — if the dispatcher stalls, the agent should
+        stall too (visible, diagnosable). The bounded queue still
+        provides memory safety.
         """
-        try:
-            await asyncio.wait_for(self.outbound.put(msg), timeout=self._timeout)
-            return True
-        except asyncio.TimeoutError:
-            logger.error(
-                "Outbound queue full (size {}), message dropped after {}s timeout",
-                self.outbound.qsize(),
-                self._timeout,
-            )
-            return False
+        await self.outbound.put(msg)
+        return True
 
     async def consume_outbound(self) -> OutboundMessage:
         """Consume the next outbound message (blocks until available)."""

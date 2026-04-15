@@ -66,13 +66,24 @@ async def test_publish_outbound_returns_true_on_success():
 
 
 @pytest.mark.asyncio
-async def test_publish_outbound_returns_false_on_full_queue():
-    bus = MessageBus(maxsize=2, timeout=0.01)
+async def test_publish_outbound_blocks_on_full_queue():
+    """Outbound publish blocks until space is available (never drops replies)."""
+    bus = MessageBus(maxsize=2)
     assert await bus.publish_outbound(_make_outbound("r1")) is True
     assert await bus.publish_outbound(_make_outbound("r2")) is True
-    # Queue is now full — third publish should return False
-    assert await bus.publish_outbound(_make_outbound("r3")) is False
     assert bus.outbound_size == 2
+
+    # Third publish will block — consume one to unblock it
+    async def _drain_after_delay():
+        await asyncio.sleep(0.05)
+        return await bus.consume_outbound()
+
+    drain_task = asyncio.create_task(_drain_after_delay())
+    result = await bus.publish_outbound(_make_outbound("r3"))
+    assert result is True
+    assert bus.outbound_size == 2  # r2 + r3 (r1 was consumed)
+    drained = await drain_task
+    assert drained.content == "r1"
 
 
 @pytest.mark.asyncio
