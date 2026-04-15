@@ -601,6 +601,7 @@ class Consolidator:
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
             self.store.raw_archive(messages)
+            self.store.flush_history()
             return None
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
@@ -622,7 +623,9 @@ class Consolidator:
             if _PROFILING:
                 _est_t0 = _time_mod.perf_counter()
             try:
-                estimated, source = self.estimate_session_prompt_tokens(session)
+                estimated, source = await asyncio.to_thread(
+                    self.estimate_session_prompt_tokens, session
+                )
             except Exception:
                 logger.exception("Token estimation failed for {}", session.key)
                 estimated, source = 0, "error"
@@ -686,7 +689,9 @@ class Consolidator:
                 self.sessions.save(session)
 
                 try:
-                    estimated, source = self.estimate_session_prompt_tokens(session)
+                    estimated, source = await asyncio.to_thread(
+                    self.estimate_session_prompt_tokens, session
+                )
                 except Exception:
                     logger.exception("Token estimation failed for {}", session.key)
                     estimated, source = 0, "error"

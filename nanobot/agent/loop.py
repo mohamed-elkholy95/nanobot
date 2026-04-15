@@ -187,7 +187,11 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
-        self._extra_hooks: list[AgentHook] = hooks or []
+        self._extra_hooks: list[AgentHook] = list(hooks or [])
+        # Register ProfilingHook if profiling is enabled via config or env
+        from nanobot.agent.profiling import ProfilingHook, is_profiling_enabled
+        if is_profiling_enabled(defaults):
+            self._extra_hooks.append(ProfilingHook())
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -420,7 +424,7 @@ class AgentLoop:
                 "channel": channel,
                 "chat_id": chat_id,
                 "message_id": message_id,
-                "session_key": f"{channel}:{chat_id}",
+                "session_key": session.key if session else f"{channel}:{chat_id}",
             },
             progress_callback=on_progress,
             checkpoint_callback=_checkpoint,

@@ -35,13 +35,13 @@ def test_stream_end_removes_from_active():
 
 
 def test_fallback_key_without_stream_id():
-    # Without stream_id, key should be channel:chat_id
+    # Without _stream_id, key should be channel:chat_id
     msg = OutboundMessage(channel="tg", chat_id="c1", content="hi", metadata={"_stream_delta": True})
-    key = msg.metadata.get("stream_id") or f"{msg.channel}:{msg.chat_id}"
+    key = msg.metadata.get("_stream_id") or f"{msg.channel}:{msg.chat_id}"
     assert key == "tg:c1"
 
 
 def test_stream_id_preferred_over_fallback():
-    msg = OutboundMessage(channel="tg", chat_id="c1", content="hi", metadata={"_stream_delta": True, "stream_id": "s42"})
-    key = msg.metadata.get("stream_id") or f"{msg.channel}:{msg.chat_id}"
+    msg = OutboundMessage(channel="tg", chat_id="c1", content="hi", metadata={"_stream_delta": True, "_stream_id": "s42"})
+    key = msg.metadata.get("_stream_id") or f"{msg.channel}:{msg.chat_id}"
     assert key == "s42"

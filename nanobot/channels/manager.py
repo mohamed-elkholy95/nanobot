@@ -176,7 +176,7 @@ class ChannelManager:
                 # First delta for a stream is dispatched immediately (no coalescing) so the
                 # user sees output without waiting for the batching window to fill.
                 if msg.metadata.get("_stream_delta") and not msg.metadata.get("_stream_end"):
-                    stream_key = msg.metadata.get("stream_id") or f"{msg.channel}:{msg.chat_id}"
+                    stream_key = msg.metadata.get("_stream_id") or f"{msg.channel}:{msg.chat_id}"
                     if stream_key not in self._active_streams:
                         # First delta for this stream — dispatch immediately, skip coalescing
                         self._active_streams.add(stream_key)
@@ -187,7 +187,7 @@ class ChannelManager:
 
                 # Clean up stream tracking when the stream ends
                 if msg.metadata.get("_stream_end"):
-                    stream_key = msg.metadata.get("stream_id") or f"{msg.channel}:{msg.chat_id}"
+                    stream_key = msg.metadata.get("_stream_id") or f"{msg.channel}:{msg.chat_id}"
                     self._active_streams.discard(stream_key)
 
                 channel = self.channels.get(msg.channel)

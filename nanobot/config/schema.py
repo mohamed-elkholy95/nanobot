@@ -85,7 +85,7 @@ class AgentDefaults(Base):
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
     dream: DreamConfig = Field(default_factory=DreamConfig)
-    profiling: bool = False  # Enable agent loop profiling (also via NANOBOT_PROFILING=1)
+    profiling: bool = False  # Register ProfilingHook for iteration/tool timing. For internal timing guards use NANOBOT_PROFILING=1 env var (evaluated at import time).
 
 
 class AgentsConfig(Base):
