@@ -32,6 +32,7 @@ class ChannelManager:
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._active_streams: set[str] = set()
 
         self._init_channels()
 
@@ -171,10 +172,23 @@ class ChannelManager:
                         continue
 
                 # Coalesce consecutive _stream_delta messages for the same (channel, chat_id)
-                # to reduce API calls and improve streaming latency
+                # to reduce API calls and improve streaming latency.
+                # First delta for a stream is dispatched immediately (no coalescing) so the
+                # user sees output without waiting for the batching window to fill.
                 if msg.metadata.get("_stream_delta") and not msg.metadata.get("_stream_end"):
-                    msg, extra_pending = self._coalesce_stream_deltas(msg)
-                    pending.extend(extra_pending)
+                    stream_key = msg.metadata.get("stream_id") or f"{msg.channel}:{msg.chat_id}"
+                    if stream_key not in self._active_streams:
+                        # First delta for this stream — dispatch immediately, skip coalescing
+                        self._active_streams.add(stream_key)
+                    else:
+                        # Subsequent deltas — coalesce as before
+                        msg, extra_pending = self._coalesce_stream_deltas(msg)
+                        pending.extend(extra_pending)
+
+                # Clean up stream tracking when the stream ends
+                if msg.metadata.get("_stream_end"):
+                    stream_key = msg.metadata.get("stream_id") or f"{msg.channel}:{msg.chat_id}"
+                    self._active_streams.discard(stream_key)
 
                 channel = self.channels.get(msg.channel)
                 if channel:
