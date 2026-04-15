@@ -1066,13 +1066,15 @@ def agent(
                         turn_response.clear()
                         renderer = StreamRenderer(render_markdown=markdown)
 
-                        await bus.publish_inbound(InboundMessage(
+                        if not await bus.publish_inbound(InboundMessage(
                             channel=cli_channel,
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
                             metadata={"_wants_stream": True},
-                        ))
+                        )):
+                            logger.warning("CLI message dropped (bus full)")
+                            continue
 
                         await turn_done.wait()
 

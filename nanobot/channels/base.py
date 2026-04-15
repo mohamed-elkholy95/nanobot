@@ -168,7 +168,10 @@ class BaseChannel(ABC):
             session_key_override=session_key,
         )
 
-        await self.bus.publish_inbound(msg)
+        if not await self.bus.publish_inbound(msg):
+            logger.warning(
+                "Message from {}:{} dropped (bus full)", sender_id, chat_id,
+            )
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:

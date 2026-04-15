@@ -586,7 +586,11 @@ class AgentLoop:
                         item = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
-                    await self.bus.publish_inbound(item)
+                    if not await self.bus.publish_inbound(item):
+                        logger.warning(
+                            "Leftover message dropped during session cleanup (bus full)",
+                        )
+                        continue
                     leftover += 1
                 if leftover:
                     logger.info(
