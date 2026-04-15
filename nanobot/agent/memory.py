@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING, Any, Callable
 from loguru import logger
 
 from nanobot.utils.prompt_templates import render_template
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think
+from nanobot.utils.helpers import (
+    ensure_dir,
+    estimate_message_tokens,
+    estimate_prompt_tokens_chain,
+    strip_think,
+)
 
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.tools.registry import ToolRegistry
@@ -27,6 +32,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
+
 
 class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
@@ -49,9 +55,17 @@ class MemoryStore:
         self.user_file = workspace / "USER.md"
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md",
-        ])
+        self._pending_entries: list[dict[str, Any]] = []
+        self._cursor_byte_offset: int = 0
+        self._cached_since_cursor: int = -1
+        self._git = GitStore(
+            workspace,
+            tracked_files=[
+                "SOUL.md",
+                "USER.md",
+                "memory/MEMORY.md",
+            ],
+        )
         self._maybe_migrate_legacy_history()
 
     @property
@@ -121,15 +135,17 @@ class MemoryStore:
             match = self._LEGACY_TIMESTAMP_RE.match(chunk)
             if match:
                 timestamp = match.group(1)
-                remainder = chunk[match.end():].lstrip()
+                remainder = chunk[match.end() :].lstrip()
                 if remainder:
                     content = remainder
 
-            entries.append({
-                "cursor": cursor,
-                "timestamp": timestamp,
-                "content": content,
-            })
+            entries.append(
+                {
+                    "cursor": cursor,
+                    "timestamp": timestamp,
+                    "content": content,
+                }
+            )
         return entries
 
     def _split_legacy_history_chunks(self, text: str) -> list[str]:
@@ -170,7 +186,7 @@ class MemoryStore:
         match = self._LEGACY_TIMESTAMP_RE.match(first_nonempty)
         if not match:
             return False
-        return first_nonempty[match.end():].lstrip().startswith("[RAW]")
+        return first_nonempty[match.end() :].lstrip().startswith("[RAW]")
 
     def _legacy_fallback_timestamp(self) -> str:
         try:
@@ -221,17 +237,30 @@ class MemoryStore:
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
     def append_history(self, entry: str) -> int:
-        """Append *entry* to history.jsonl and return its auto-incrementing cursor."""
+        """Buffer *entry* for later flush and return its auto-incrementing cursor."""
         cursor = self._next_cursor()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        record = {"cursor": cursor, "timestamp": ts, "content": strip_think(entry.rstrip()) or entry.rstrip()}
-        with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        record = {
+            "cursor": cursor,
+            "timestamp": ts,
+            "content": strip_think(entry.rstrip()) or entry.rstrip(),
+        }
+        self._pending_entries.append(record)
         self._cursor_file.write_text(str(cursor), encoding="utf-8")
         return cursor
 
+    def flush_history(self) -> None:
+        """Write all buffered entries to history.jsonl."""
+        if not self._pending_entries:
+            return
+        with open(self.history_file, "a", encoding="utf-8") as f:
+            f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in self._pending_entries)
+        self._pending_entries.clear()
+
     def _next_cursor(self) -> int:
         """Read the current cursor counter and return next value."""
+        if self._pending_entries:
+            return self._pending_entries[-1]["cursor"] + 1
         if self._cursor_file.exists():
             try:
                 return int(self._cursor_file.read_text(encoding="utf-8").strip()) + 1
@@ -244,18 +273,50 @@ class MemoryStore:
         return 1
 
     def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
-        """Return history entries with cursor > *since_cursor*."""
-        return [e for e in self._read_entries() if e["cursor"] > since_cursor]
+        """Return history entries with cursor > *since_cursor*.
+
+        Uses a cached byte offset for incremental reads when the caller
+        asks for entries that can only come from new appends.
+        Otherwise falls back to a full scan.
+        """
+        if (
+            since_cursor >= self._cached_since_cursor
+            and self._cached_since_cursor >= 0
+            and self._cursor_byte_offset > 0
+            and self.history_file.exists()
+        ):
+            entries = self._read_entries_from_offset(self._cursor_byte_offset, since_cursor)
+        else:
+            entries = [e for e in self._read_entries() if e["cursor"] > since_cursor]
+        if self.history_file.exists():
+            self._cursor_byte_offset = self.history_file.stat().st_size
+        # Track the highest cursor value seen
+        max_cursor = since_cursor
+        for e in entries:
+            c = e.get("cursor", 0)
+            if c > max_cursor:
+                max_cursor = c
+        # Include buffered entries not yet flushed to disk
+        for e in self._pending_entries:
+            if e["cursor"] > since_cursor:
+                entries.append(e)
+                if e["cursor"] > max_cursor:
+                    max_cursor = e["cursor"]
+        self._cached_since_cursor = max_cursor
+        return entries
 
     def compact_history(self) -> None:
         """Drop oldest entries if the file exceeds *max_history_entries*."""
+        self.flush_history()
         if self.max_history_entries <= 0:
             return
         entries = self._read_entries()
         if len(entries) <= self.max_history_entries:
             return
-        kept = entries[-self.max_history_entries:]
+        kept = entries[-self.max_history_entries :]
         self._write_entries(kept)
+        self._cursor_byte_offset = 0
+        self._cached_since_cursor = -1
 
     # -- JSONL helpers -------------------------------------------------------
 
@@ -271,6 +332,26 @@ class MemoryStore:
                             entries.append(json.loads(line))
                         except json.JSONDecodeError:
                             continue
+        except FileNotFoundError:
+            pass
+        return entries
+
+    def _read_entries_from_offset(self, offset: int, since_cursor: int) -> list[dict[str, Any]]:
+        """Read entries from a byte offset, returning those with cursor > since_cursor."""
+        entries: list[dict[str, Any]] = []
+        try:
+            with open(self.history_file, "r", encoding="utf-8") as f:
+                f.seek(offset)
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("cursor", 0) > since_cursor:
+                            entries.append(entry)
+                    except (json.JSONDecodeError, KeyError):
+                        continue
         except FileNotFoundError:
             pass
         return entries
@@ -320,7 +401,9 @@ class MemoryStore:
         for message in messages:
             if not message.get("content"):
                 continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            tools = (
+                f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            )
             lines.append(
                 f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
             )
@@ -328,14 +411,8 @@ class MemoryStore:
 
     def raw_archive(self, messages: list[dict]) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
-        self.append_history(
-            f"[RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
-        )
-        logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
-        )
-
+        self.append_history(f"[RAW] {len(messages)} messages\n{self._format_messages(messages)}")
+        logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
 
 
 # ---------------------------------------------------------------------------
@@ -370,13 +447,80 @@ class Consolidator:
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
-        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-            weakref.WeakValueDictionary()
-        )
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._last_estimate: dict[str, tuple[int, int, int, int, float]] = {}
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
+
+    def _workspace_mtime_sum(self) -> float:
+        """Sum of mtimes for prompt-contributing workspace files."""
+        total = 0.0
+        try:
+            workspace = self.store.workspace
+        except AttributeError:
+            return 0.0
+        for name in ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "memory/MEMORY.md"):
+            path = workspace / name
+            try:
+                total += path.stat().st_mtime
+            except OSError:
+                pass
+        skills_dir = workspace / "skills"
+        try:
+            for d in skills_dir.iterdir():
+                if d.is_dir():
+                    skill_md = d / "SKILL.md"
+                    try:
+                        total += skill_md.stat().st_mtime
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
+
+    def _get_history_cursor(self) -> int:
+        """Read current history cursor from store."""
+        try:
+            cursor_file = self.store._cursor_file
+        except AttributeError:
+            return 0
+        if cursor_file.exists():
+            try:
+                return int(cursor_file.read_text(encoding="utf-8").strip())
+            except (ValueError, OSError):
+                pass
+        return 0
+
+    def _should_skip_estimation(self, session: Session) -> bool:
+        """Check if estimation can be safely skipped."""
+        cached = self._last_estimate.get(session.key)
+        if not cached:
+            return False
+        estimate, msg_count, last_consol, cursor, mtime_sum = cached
+        budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+        if estimate >= budget * 0.5:
+            return False
+        if len(session.messages) != msg_count:
+            return False
+        if session.last_consolidated != last_consol:
+            return False
+        if self._get_history_cursor() != cursor:
+            return False
+        if abs(self._workspace_mtime_sum() - mtime_sum) > 0.001:
+            return False
+        return True
+
+    def _record_estimation(self, session: Session, estimate: int) -> None:
+        """Store estimation result for future skip checks."""
+        self._last_estimate[session.key] = (
+            estimate,
+            len(session.messages),
+            session.last_consolidated,
+            self._get_history_cursor(),
+            self._workspace_mtime_sum(),
+        )
 
     def pick_consolidation_boundary(
         self,
@@ -419,7 +563,7 @@ class Consolidator:
     def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=0)
-        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        channel, chat_id = session.key.split(":", 1) if ":" in session.key else (None, None)
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
@@ -459,11 +603,13 @@ class Consolidator:
             )
             summary = response.content or "[no summary]"
             self.store.append_history(summary)
+            self.store.flush_history()
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
             self.store.raw_archive(messages)
-            return None
+            self.store.flush_history()
+            return f"[RAW] {len(messages)} messages archived"
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
         """Loop: archive old messages until prompt fits within safe budget.
@@ -476,15 +622,21 @@ class Consolidator:
 
         lock = self.get_lock(session.key)
         async with lock:
+            if self._should_skip_estimation(session):
+                return
+
             budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
             target = budget // 2
             try:
-                estimated, source = self.estimate_session_prompt_tokens(session)
+                estimated, source = await asyncio.to_thread(
+                    self.estimate_session_prompt_tokens, session
+                )
             except Exception:
                 logger.exception("Token estimation failed for {}", session.key)
                 estimated, source = 0, "error"
             if estimated <= 0:
                 return
+            self._record_estimation(session, estimated)
             if estimated < budget:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
                 logger.debug(
@@ -520,7 +672,7 @@ class Consolidator:
                     )
                     return
 
-                chunk = session.messages[session.last_consolidated:end_idx]
+                chunk = session.messages[session.last_consolidated : end_idx]
                 if not chunk:
                     return
 
@@ -535,11 +687,14 @@ class Consolidator:
                 )
                 if not await self.archive(chunk):
                     return
+                self._last_estimate.pop(session.key, None)
                 session.last_consolidated = end_idx
                 self.sessions.save(session)
 
                 try:
-                    estimated, source = self.estimate_session_prompt_tokens(session)
+                    estimated, source = await asyncio.to_thread(
+                        self.estimate_session_prompt_tokens, session
+                    )
                 except Exception:
                     logger.exception("Token estimation failed for {}", session.key)
                     estimated, source = 0, "error"
@@ -589,11 +744,13 @@ class Dream:
         workspace = self.store.workspace
         # Allow reading builtin skills for reference during skill creation
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
-        tools.register(ReadFileTool(
-            workspace=workspace,
-            allowed_dir=workspace,
-            extra_allowed_dirs=extra_read,
-        ))
+        tools.register(
+            ReadFileTool(
+                workspace=workspace,
+                allowed_dir=workspace,
+                extra_allowed_dirs=extra_read,
+            )
+        )
         tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
         # write_file resolves relative paths from workspace root, but can only
         # write under skills/ so the prompt can safely use skills/<name>/SKILL.md.
@@ -644,13 +801,14 @@ class Dream:
         batch = entries[: self.max_batch_size]
         logger.info(
             "Dream: processing {} entries (cursor {}→{}), batch={}",
-            len(entries), last_cursor, batch[-1]["cursor"], len(batch),
+            len(entries),
+            last_cursor,
+            batch[-1]["cursor"],
+            len(batch),
         )
 
         # Build history text for LLM
-        history_text = "\n".join(
-            f"[{e['timestamp']}] {e['content']}" for e in batch
-        )
+        history_text = "\n".join(f"[{e['timestamp']}] {e['content']}" for e in batch)
 
         # Current file contents
         current_date = datetime.now().strftime("%Y-%m-%d")
@@ -666,9 +824,7 @@ class Dream:
         )
 
         # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
-        phase1_prompt = (
-            f"## Conversation History\n{history_text}\n\n{file_context}"
-        )
+        phase1_prompt = f"## Conversation History\n{history_text}\n\n{file_context}"
 
         try:
             phase1_response = await self.provider.chat_with_retry(
@@ -693,9 +849,8 @@ class Dream:
         existing_skills = self._list_existing_skills()
         skills_section = ""
         if existing_skills:
-            skills_section = (
-                "\n\n## Existing Skills\n"
-                + "\n".join(f"- {s}" for s in existing_skills)
+            skills_section = "\n\n## Existing Skills\n" + "\n".join(
+                f"- {s}" for s in existing_skills
             )
         phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
 
@@ -714,20 +869,28 @@ class Dream:
         ]
 
         try:
-            result = await self._runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                fail_on_tool_error=False,
-            ))
+            result = await self._runner.run(
+                AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    fail_on_tool_error=False,
+                )
+            )
             logger.debug(
                 "Dream Phase 2 complete: stop_reason={}, tool_events={}",
-                result.stop_reason, len(result.tool_events),
+                result.stop_reason,
+                len(result.tool_events),
             )
-            for ev in (result.tool_events or []):
-                logger.info("Dream tool_event: name={}, status={}, detail={}", ev.get("name"), ev.get("status"), ev.get("detail", "")[:200])
+            for ev in result.tool_events or []:
+                logger.info(
+                    "Dream tool_event: name={}, status={}, detail={}",
+                    ev.get("name"),
+                    ev.get("status"),
+                    ev.get("detail", "")[:200],
+                )
         except Exception:
             logger.exception("Dream Phase 2 failed")
             result = None
@@ -742,18 +905,21 @@ class Dream:
         # Advance cursor — always, to avoid re-processing Phase 1
         new_cursor = batch[-1]["cursor"]
         self.store.set_last_dream_cursor(new_cursor)
+        self.store.flush_history()
         self.store.compact_history()
 
         if result and result.stop_reason == "completed":
             logger.info(
                 "Dream done: {} change(s), cursor advanced to {}",
-                len(changelog), new_cursor,
+                len(changelog),
+                new_cursor,
             )
         else:
             reason = result.stop_reason if result else "exception"
             logger.warning(
                 "Dream incomplete ({}): cursor advanced to {}",
-                reason, new_cursor,
+                reason,
+                new_cursor,
             )
 
         # Git auto-commit (only when there are actual changes)

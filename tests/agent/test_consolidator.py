@@ -55,7 +55,8 @@ class TestConsolidatorSummarize:
         mock_provider.chat_with_retry.side_effect = Exception("API error")
         messages = [{"role": "user", "content": "hello"}]
         result = await consolidator.archive(messages)
-        assert result is None  # no summary on raw dump fallback
+        assert result is not None  # non-None so caller advances last_consolidated
+        assert "[RAW]" in result
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
         assert "[RAW]" in entries[0]["content"]
