@@ -89,7 +89,12 @@ class ToolRegistry:
             )
         return tool, cast_params, None
 
-    async def execute(self, name: str, params: dict[str, Any]) -> Any:
+    async def execute(
+        self,
+        name: str,
+        params: dict[str, Any],
+        routing_context: dict[str, Any] | None = None,
+    ) -> Any:
         """Execute a tool by name with given parameters."""
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
         tool, params, error = self.prepare_call(name, params)
@@ -98,7 +103,7 @@ class ToolRegistry:
 
         try:
             assert tool is not None  # guarded by prepare_call()
-            result = await tool.execute(**params)
+            result = await tool.execute(**params, _routing_context=routing_context)
             if isinstance(result, str) and result.startswith("Error"):
                 return result + _HINT
             return result

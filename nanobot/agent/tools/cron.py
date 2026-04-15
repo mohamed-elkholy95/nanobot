@@ -105,12 +105,20 @@ class CronTool(Tool):
         at: str | None = None,
         job_id: str | None = None,
         deliver: bool = True,
+        *,
+        _routing_context: dict | None = None,
         **kwargs: Any,
     ) -> str:
+        ctx = _routing_context or {}
+        channel = ctx.get("channel", self._channel)
+        chat_id = ctx.get("chat_id", self._chat_id)
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver)
+            return self._add_job(
+                name, message, every_seconds, cron_expr, tz, at, deliver,
+                channel=channel, chat_id=chat_id,
+            )
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -126,10 +134,15 @@ class CronTool(Tool):
         tz: str | None,
         at: str | None,
         deliver: bool = True,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> str:
         if not message:
             return "Error: message is required for add"
-        if not self._channel or not self._chat_id:
+        channel = channel or self._channel
+        chat_id = chat_id or self._chat_id
+        if not channel or not chat_id:
             return "Error: no session context (channel/chat_id)"
         if tz and not cron_expr:
             return "Error: tz can only be used with cron_expr"
@@ -168,8 +181,8 @@ class CronTool(Tool):
             schedule=schedule,
             message=message,
             deliver=deliver,
-            channel=self._channel,
-            to=self._chat_id,
+            channel=channel,
+            to=chat_id,
             delete_after_run=delete_after,
         )
         return f"Created job '{job.name}' (id: {job.id})"

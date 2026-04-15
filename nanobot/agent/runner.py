@@ -70,6 +70,7 @@ class AgentRunSpec:
     context_window_tokens: int | None = None
     context_block_limit: int | None = None
     provider_retry_mode: str = "standard"
+    routing_context: dict[str, Any] | None = None
     progress_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
@@ -678,9 +679,11 @@ class AgentRunner:
             return prep_error + _HINT, event, RuntimeError(prep_error) if spec.fail_on_tool_error else None
         try:
             if tool is not None:
-                result = await tool.execute(**params)
+                result = await tool.execute(**params, _routing_context=spec.routing_context)
             else:
-                result = await spec.tools.execute(tool_call.name, params)
+                result = await spec.tools.execute(
+                    tool_call.name, params, routing_context=spec.routing_context,
+                )
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
