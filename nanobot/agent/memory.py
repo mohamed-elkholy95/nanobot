@@ -53,6 +53,8 @@ class MemoryStore:
         self.user_file = workspace / "USER.md"
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+        self._cursor_byte_offset: int = 0
+        self._cached_since_cursor: int = -1
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md",
         ])
@@ -249,7 +251,18 @@ class MemoryStore:
 
     def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
         """Return history entries with cursor > *since_cursor*."""
-        return [e for e in self._read_entries() if e["cursor"] > since_cursor]
+        if (
+            since_cursor == self._cached_since_cursor
+            and self._cursor_byte_offset > 0
+            and self.history_file.exists()
+        ):
+            entries = self._read_entries_from_offset(self._cursor_byte_offset, since_cursor)
+        else:
+            entries = [e for e in self._read_entries() if e["cursor"] > since_cursor]
+        if self.history_file.exists():
+            self._cursor_byte_offset = self.history_file.stat().st_size
+        self._cached_since_cursor = since_cursor
+        return entries
 
     def compact_history(self) -> None:
         """Drop oldest entries if the file exceeds *max_history_entries*."""
@@ -260,6 +273,8 @@ class MemoryStore:
             return
         kept = entries[-self.max_history_entries:]
         self._write_entries(kept)
+        self._cursor_byte_offset = 0
+        self._cached_since_cursor = -1
 
     # -- JSONL helpers -------------------------------------------------------
 
@@ -275,6 +290,26 @@ class MemoryStore:
                             entries.append(json.loads(line))
                         except json.JSONDecodeError:
                             continue
+        except FileNotFoundError:
+            pass
+        return entries
+
+    def _read_entries_from_offset(self, offset: int, since_cursor: int) -> list[dict[str, Any]]:
+        """Read entries from a byte offset, returning those with cursor > since_cursor."""
+        entries: list[dict[str, Any]] = []
+        try:
+            with open(self.history_file, "r", encoding="utf-8") as f:
+                f.seek(offset)
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("cursor", 0) > since_cursor:
+                            entries.append(entry)
+                    except (json.JSONDecodeError, KeyError):
+                        continue
         except FileNotFoundError:
             pass
         return entries
