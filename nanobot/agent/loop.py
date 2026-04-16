@@ -17,6 +17,7 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.profiling import ProfilingHook, is_profiling_enabled
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
@@ -192,12 +193,11 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
-        self._extra_hooks: list[AgentHook] = list(hooks or [])
-
-        from nanobot.agent.profiling import ProfilingHook, is_profiling_enabled
+        self._extra_hooks: list[AgentHook] = hooks or []
 
         if is_profiling_enabled():
-            self._extra_hooks.append(ProfilingHook())
+            # Append to a copy so we don't mutate the caller's list.
+            self._extra_hooks = list(self._extra_hooks) + [ProfilingHook()]
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
