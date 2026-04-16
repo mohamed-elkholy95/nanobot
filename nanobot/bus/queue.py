@@ -7,7 +7,13 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
+# Reasonable default for chatbot workloads: 100 messages gives the agent
+# ample headroom to drain bursts without risking unbounded memory growth.
 _DEFAULT_INBOUND_MAXSIZE = 100
+
+# Seconds to wait for a slot before dropping a message.  Long enough for
+# the agent to finish an iteration under normal load.
+_DEFAULT_PUT_TIMEOUT_S = 5.0
 
 
 class MessageBus:
@@ -31,18 +37,24 @@ class MessageBus:
     async def publish_inbound(self, msg: InboundMessage) -> bool:
         """Publish a message from a channel to the agent.
 
+        Waits up to ``_DEFAULT_PUT_TIMEOUT_S`` seconds for a slot.
         Returns ``True`` if the message was enqueued, ``False`` if the
-        inbound queue is full and the message was dropped.
+        timeout expired and the message was dropped.
         """
         try:
-            self.inbound.put_nowait(msg)
+            await asyncio.wait_for(
+                self.inbound.put(msg),
+                timeout=_DEFAULT_PUT_TIMEOUT_S,
+            )
             return True
-        except asyncio.QueueFull:
+        except asyncio.TimeoutError:
             logger.warning(
-                "Inbound queue full ({} msgs) — dropped message from {}:{}",
+                "Inbound queue full ({} msgs) — dropped message from {}:{}"
+                " (waited {:.0f}s)",
                 self.inbound.qsize(),
                 msg.channel,
                 msg.chat_id,
+                _DEFAULT_PUT_TIMEOUT_S,
             )
             return False
 

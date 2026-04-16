@@ -1,5 +1,7 @@
 """Tests for bounded MessageBus inbound queue."""
 
+from unittest.mock import patch
+
 import pytest
 
 from nanobot.bus.events import InboundMessage
@@ -27,15 +29,19 @@ async def test_publish_returns_true_when_space(small_bus):
 
 
 async def test_publish_returns_false_when_full(small_bus):
+    """A full queue should drop the message after the timeout."""
     await small_bus.publish_inbound(_msg("a"))
     await small_bus.publish_inbound(_msg("b"))
-    assert await small_bus.publish_inbound(_msg("c")) is False
+    # Use a tiny timeout so the test doesn't wait 5 seconds.
+    with patch("nanobot.bus.queue._DEFAULT_PUT_TIMEOUT_S", 0.01):
+        assert await small_bus.publish_inbound(_msg("c")) is False
 
 
 async def test_queued_messages_preserved_on_overflow(small_bus):
     await small_bus.publish_inbound(_msg("a"))
     await small_bus.publish_inbound(_msg("b"))
-    await small_bus.publish_inbound(_msg("c"))  # dropped
+    with patch("nanobot.bus.queue._DEFAULT_PUT_TIMEOUT_S", 0.01):
+        await small_bus.publish_inbound(_msg("c"))  # dropped
     assert small_bus.inbound_size == 2
     first = await small_bus.consume_inbound()
     assert first.content == "a"
@@ -44,7 +50,8 @@ async def test_queued_messages_preserved_on_overflow(small_bus):
 async def test_space_after_consume(small_bus):
     await small_bus.publish_inbound(_msg("a"))
     await small_bus.publish_inbound(_msg("b"))
-    assert await small_bus.publish_inbound(_msg("c")) is False
+    with patch("nanobot.bus.queue._DEFAULT_PUT_TIMEOUT_S", 0.01):
+        assert await small_bus.publish_inbound(_msg("c")) is False
     await small_bus.consume_inbound()  # free a slot
     assert await small_bus.publish_inbound(_msg("d")) is True
 
