@@ -192,7 +192,12 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
-        self._extra_hooks: list[AgentHook] = hooks or []
+        self._extra_hooks: list[AgentHook] = list(hooks or [])
+
+        from nanobot.agent.profiling import ProfilingHook, is_profiling_enabled
+
+        if is_profiling_enabled():
+            self._extra_hooks.append(ProfilingHook())
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
