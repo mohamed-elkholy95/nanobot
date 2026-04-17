@@ -17,6 +17,11 @@ from nanobot.config.paths import get_media_dir
 
 _IS_WINDOWS = sys.platform == "win32"
 
+# Match shell expansion forms: $(...), `...`, ${...}.
+_EXPANSION_RE = re.compile(r"\$\(|`|\$\{")
+# Match references to nanobot internal-state files (#2989). Lower-cased.
+_PROTECTED_TARGET_RE = re.compile(r"\.jsonl\b|\.dream_cursor\b|dream_cursor")
+
 
 @tool_parameters(
     tool_parameters_schema(
@@ -268,13 +273,29 @@ class ExecTool(Tool):
         return env
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
-        """Best-effort safety guard for potentially destructive commands."""
+        """Best-effort safety guard for potentially destructive commands.
+
+        These checks run on the raw command string before bash sees it. They
+        cannot catch every shell-expansion trick (``${IFS}``, ``$(...)``,
+        backticks). For hard isolation set ``tools.exec.sandbox = "bwrap"``
+        so writes outside the workspace are blocked at the kernel level.
+        """
         cmd = command.strip()
         lower = cmd.lower()
 
         for pattern in self.deny_patterns:
             if re.search(pattern, lower):
                 return "Error: Command blocked by safety guard (dangerous pattern detected)"
+
+        # Defense-in-depth for the #2989 protections. The literal-substring
+        # patterns above are bypassed when both the command and the protected
+        # filename are split via expansion, e.g. ``$(echo tee) hist$(printf
+        # ory).jsonl``. If the raw command contains any expansion AND still
+        # mentions a .jsonl path or .dream_cursor, refuse it. Legitimate uses
+        # of $() rarely target .jsonl files; targeting one alongside expansion
+        # is treated as suspicious.
+        if _EXPANSION_RE.search(cmd) and _PROTECTED_TARGET_RE.search(lower):
+            return "Error: Command blocked by safety guard (dangerous pattern detected)"
 
         if self.allow_patterns:
             if not any(re.search(p, lower) for p in self.allow_patterns):

@@ -116,6 +116,56 @@ def test_exec_allows_reads_of_history_jsonl(command):
     assert result is None
 
 
+# --- Hardening: shell expansion must not defeat #2989 protections --------
+#
+# The literal-substring deny patterns above were bypassable by splitting both
+# the command and the protected filename via expansion, e.g.
+# `$(echo tee) /tmp/h/hist$(printf ory).jsonl`. The new defense-in-depth
+# check refuses any command that combines shell expansion with a reference
+# to a .jsonl path or .dream_cursor.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Verified-live bypasses against the original patterns.
+        "$(echo tee) /tmp/h/hist$(printf ory).jsonl <<< PWNED",
+        "`printf tee` /tmp/h/hist`printf ory`.jsonl <<< PWNED",
+        "${EDITOR:-tee} /tmp/h/history.jsonl <<< PWNED",
+        # Variants that target the cursor file via expansion.
+        "$(echo cp) src /tmp/.dream_cursor",
+        "echo x > /tmp/$(echo .dream_cursor)",
+    ],
+)
+def test_exec_blocks_expansion_targeting_protected_files(command):
+    """Hardens #2989: expansion + .jsonl/.dream_cursor target must be blocked."""
+    tool = ExecTool()
+    result = tool._guard_command(command, "/tmp")
+    assert result is not None
+    assert "dangerous pattern" in result.lower()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Normal $() use that does not target nanobot state files.
+        "echo $(date)",
+        "cp src/$(basename dst).txt /tmp/",
+        "tar czf backup-$(date +%s).tar.gz src/",
+        "ls /tmp/$(whoami)",
+        "echo ${HOME}/notes.md",
+        "git log --since=$(date -d '1 week ago' +%Y-%m-%d)",
+        # .log / .txt with expansion is fine — only .jsonl is protected.
+        "tee /tmp/build-$(date +%s).log",
+    ],
+)
+def test_exec_allows_legitimate_command_substitution(command):
+    """Regression: innocent uses of $() / backticks / ${} must still execute."""
+    tool = ExecTool()
+    result = tool._guard_command(command, "/tmp")
+    assert result is None, f"unexpectedly blocked: {command!r} → {result!r}"
+
+
 # --- #2826: working_dir must not escape the configured workspace ---------
 
 
