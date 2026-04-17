@@ -689,6 +689,63 @@ def test_backward_compat_verify_disabled(monkeypatch) -> None:
     assert len(items) == 1, "With verification disabled, emails should be accepted as before"
 
 
+def test_self_reply_loop_guard_skips_from_address(monkeypatch) -> None:
+    """Emails whose sender matches from_address are skipped and marked seen (issue #3215)."""
+    raw = _make_raw_email(from_addr="bot@example.com", subject="Self", body="I am the bot")
+    fake = _make_fake_imap(raw)
+    monkeypatch.setattr("nanobot.channels.email.imaplib.IMAP4_SSL", lambda _h, _p: fake)
+
+    cfg = _make_config(from_address="bot@example.com")
+    channel = EmailChannel(cfg, MessageBus())
+    items = channel._fetch_new_messages()
+
+    assert items == [], "Self-email must not be processed (would cause reply loop)"
+    assert fake.store_calls == [(b"1", "+FLAGS", "\\Seen")], (
+        "Skipped self-email should still be marked seen to avoid re-polling"
+    )
+
+
+def test_self_reply_loop_guard_matches_named_from_address(monkeypatch) -> None:
+    """Self-reply guard must extract the email from 'Name <addr>' form on both sides."""
+    raw = _make_raw_email(from_addr="Agent Bot <bot@example.com>", subject="Named", body="x")
+    fake = _make_fake_imap(raw)
+    monkeypatch.setattr("nanobot.channels.email.imaplib.IMAP4_SSL", lambda _h, _p: fake)
+
+    # from_address configured with a display name too
+    cfg = _make_config(from_address="Nanobot <bot@example.com>")
+    channel = EmailChannel(cfg, MessageBus())
+    items = channel._fetch_new_messages()
+
+    assert items == [], "Display-name form must still be recognized as self"
+
+
+def test_self_reply_loop_guard_falls_back_to_smtp_username(monkeypatch) -> None:
+    """When from_address is empty, smtp_username is also treated as an own-address."""
+    raw = _make_raw_email(from_addr="bot@example.com", subject="Self", body="x")
+    fake = _make_fake_imap(raw)
+    monkeypatch.setattr("nanobot.channels.email.imaplib.IMAP4_SSL", lambda _h, _p: fake)
+
+    cfg = _make_config(from_address="", smtp_username="bot@example.com")
+    channel = EmailChannel(cfg, MessageBus())
+    items = channel._fetch_new_messages()
+
+    assert items == [], "smtp_username must also guard against self-reply loops"
+
+
+def test_external_sender_not_affected_by_loop_guard(monkeypatch) -> None:
+    """Emails from an external sender must still be accepted when from_address is set."""
+    raw = _make_raw_email(from_addr="alice@example.com", subject="Hi", body="external")
+    fake = _make_fake_imap(raw)
+    monkeypatch.setattr("nanobot.channels.email.imaplib.IMAP4_SSL", lambda _h, _p: fake)
+
+    cfg = _make_config(from_address="bot@example.com")
+    channel = EmailChannel(cfg, MessageBus())
+    items = channel._fetch_new_messages()
+
+    assert len(items) == 1
+    assert items[0]["sender"] == "alice@example.com"
+
+
 def test_email_content_tagged_with_email_context(monkeypatch) -> None:
     """Email content should be prefixed with [EMAIL-CONTEXT] for LLM isolation."""
     raw = _make_raw_email(subject="Tagged", body="Check the tag")

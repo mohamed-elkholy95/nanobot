@@ -387,6 +387,32 @@ class EmailChannel(BaseChannel):
                         client.store(imap_id, "+FLAGS", "\\Seen")
                     continue
 
+                # --- Self-reply loop guard (issue #3215) ---
+                # Skip emails that look like they came from this bot's own
+                # address; otherwise replying to them produces an infinite
+                # reply loop. Mark seen and dedupe so we don't re-poll them.
+                own_addresses = {
+                    parseaddr(addr)[1].strip().lower()
+                    for addr in (
+                        self.config.from_address,
+                        self.config.smtp_username,
+                        self.config.imap_username,
+                    )
+                    if addr
+                }
+                if sender in own_addresses:
+                    logger.debug(
+                        "Email from {} skipped: matches bot's own address (self-reply loop guard)",
+                        sender,
+                    )
+                    if mark_seen:
+                        client.store(imap_id, "+FLAGS", "\\Seen")
+                    if uid:
+                        cycle_uids.add(uid)
+                        if dedupe:
+                            self._processed_uids.add(uid)
+                    continue
+
                 # --- Anti-spoofing: verify Authentication-Results ---
                 spf_pass, dkim_pass = self._check_authentication_results(parsed)
                 if self.config.verify_spf and not spf_pass:
