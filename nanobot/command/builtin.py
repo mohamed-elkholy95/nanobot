@@ -109,6 +109,34 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_clear(ctx: CommandContext) -> OutboundMessage:
+    """Clear session history without stopping any running tasks.
+
+    Unlike /new, active tasks keep running.  Their late saves are dropped
+    by the turn-generation guard in :class:`SessionManager` so they cannot
+    resurrect the cleared history on disk.  Unconsolidated messages are
+    still archived in the background, mirroring /new's behavior so users
+    don't silently lose history that hasn't yet been written to long-term
+    archives.
+    """
+    loop = ctx.loop
+    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    msg_count = len(session.get_history(max_messages=0))
+    snapshot = session.messages[session.last_consolidated:]
+    session.clear()
+    loop.sessions.save(session)
+    loop.sessions.invalidate(session.key)
+    if snapshot:
+        loop._schedule_background(loop.consolidator.archive(snapshot))
+    noun = "message" if msg_count == 1 else "messages"
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Cleared {msg_count} {noun} from session history.",
+        metadata=dict(ctx.msg.metadata or {}),
+    )
+
+
 async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     """Manually trigger a Dream consolidation run."""
     import time
@@ -381,6 +409,7 @@ def build_help_text() -> str:
     lines = [
         "🐈 nanobot commands:",
         "/new — Stop current task and start a new conversation",
+        "/clear — Clear session history without stopping active tasks",
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
@@ -399,6 +428,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
+    router.exact("/clear", cmd_clear)
     router.exact("/status", cmd_status)
     router.exact("/history", cmd_history)
     router.prefix("/history ", cmd_history)

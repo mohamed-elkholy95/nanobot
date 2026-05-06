@@ -1,5 +1,6 @@
 """Session management for conversation history."""
 
+import contextvars
 import json
 import os
 import shutil
@@ -22,6 +23,28 @@ from nanobot.utils.helpers import (
 
 FILE_MAX_MESSAGES = 2000
 
+# Per-task snapshot of session generations captured at the start of a turn.
+# SessionManager.save() refuses to persist a session whose actual generation
+# has advanced past the snapshot — preventing in-flight turns from
+# resurrecting cleared history after /clear has wiped it on disk.
+_active_turn_generations: contextvars.ContextVar[dict[str, int]] = contextvars.ContextVar(
+    "_session_active_turn_generations", default={}
+)
+
+
+def enter_turn_generation_guard(session: "Session") -> contextvars.Token:
+    """Snapshot a session's generation for the current async context.
+
+    Caller is responsible for calling :func:`exit_turn_generation_guard` with
+    the returned token in a ``finally`` block.
+    """
+    prior = _active_turn_generations.get({})
+    return _active_turn_generations.set({**prior, session.key: session.generation})
+
+
+def exit_turn_generation_guard(token: contextvars.Token) -> None:
+    _active_turn_generations.reset(token)
+
 
 @dataclass
 class Session:
@@ -33,6 +56,9 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+    # Bumped by clear(); turn-scoped guard in SessionManager.save uses this
+    # to detect that a session was cleared mid-turn and refuse stale writes.
+    generation: int = 0
 
     @staticmethod
     def _annotate_message_time(message: dict[str, Any], content: Any) -> Any:
@@ -158,9 +184,16 @@ class Session:
         return out
 
     def clear(self) -> None:
-        """Clear all messages and reset session to initial state."""
+        """Clear all messages and reset session to initial state.
+
+        Bumps ``generation`` so any in-flight turn that captured the
+        pre-clear value can detect the clear and refuse to write its
+        late save through :meth:`SessionManager.save` — see the
+        turn-generation guard there.
+        """
         self.messages = []
         self.last_consolidated = 0
+        self.generation += 1
         self.updated_at = datetime.now()
 
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
@@ -303,6 +336,7 @@ class SessionManager:
             created_at = None
             updated_at = None
             last_consolidated = 0
+            generation = 0
 
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -317,6 +351,7 @@ class SessionManager:
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         updated_at = datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
+                        generation = data.get("generation", 0)
                     else:
                         messages.append(data)
 
@@ -326,7 +361,8 @@ class SessionManager:
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
+                generation=generation,
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -347,6 +383,7 @@ class SessionManager:
             created_at: datetime | None = None
             updated_at: datetime | None = None
             last_consolidated = 0
+            generation = 0
             skipped = 0
 
             with open(path, encoding="utf-8") as f:
@@ -369,6 +406,7 @@ class SessionManager:
                             with suppress(ValueError, TypeError):
                                 updated_at = datetime.fromisoformat(data["updated_at"])
                         last_consolidated = data.get("last_consolidated", 0)
+                        generation = data.get("generation", 0)
                     else:
                         messages.append(data)
 
@@ -384,7 +422,8 @@ class SessionManager:
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
+                generation=generation,
             )
         except Exception as e:
             logger.warning("Repair failed for session {}: {}", key, e)
@@ -409,7 +448,21 @@ class SessionManager:
         should be enabled during graceful shutdown so that filesystems with
         write-back caching (e.g. rclone VFS, NFS, FUSE mounts) do not lose
         the most recent writes.
+
+        Refuses to persist when a turn-generation guard is active for this
+        session and ``session.generation`` no longer matches what the turn
+        captured — i.e. the session was cleared (via /clear or /new) since
+        the in-flight turn began.  This prevents stale in-flight turns from
+        resurrecting wiped history on disk.
         """
+        expected = _active_turn_generations.get({}).get(session.key)
+        if expected is not None and session.generation != expected:
+            logger.info(
+                "Skipping stale session save for {}: turn captured gen {}, current is {}",
+                session.key, expected, session.generation,
+            )
+            return
+
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
 
@@ -421,7 +474,8 @@ class SessionManager:
                     "created_at": session.created_at.isoformat(),
                     "updated_at": session.updated_at.isoformat(),
                     "metadata": session.metadata,
-                    "last_consolidated": session.last_consolidated
+                    "last_consolidated": session.last_consolidated,
+                    "generation": session.generation,
                 }
                 f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
                 for msg in session.messages:

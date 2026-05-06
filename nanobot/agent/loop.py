@@ -44,7 +44,12 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import (
+    Session,
+    SessionManager,
+    enter_turn_generation_guard,
+    exit_turn_generation_guard,
+)
 from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
@@ -939,18 +944,26 @@ class AgentLoop:
                 current_role=current_role,
                 sender_id=msg.sender_id,
             )
-            final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
-                messages, session=session, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
-                metadata=msg.metadata,
-                session_key=key,
-                pending_queue=pending_queue,
-            )
-            self._save_turn(session, all_msgs, 1 + len(history))
-            session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
-            self._clear_runtime_checkpoint(session)
-            self.sessions.save(session)
-            self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            # Capture session.generation before the long-running loop so that
+            # any concurrent /clear (in another async task) is detected by
+            # SessionManager.save and our late saves are dropped instead of
+            # resurrecting the cleared history on disk.
+            _gen_token = enter_turn_generation_guard(session)
+            try:
+                final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
+                    messages, session=session, channel=channel, chat_id=chat_id,
+                    message_id=msg.metadata.get("message_id"),
+                    metadata=msg.metadata,
+                    session_key=key,
+                    pending_queue=pending_queue,
+                )
+                self._save_turn(session, all_msgs, 1 + len(history))
+                session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+                self._clear_runtime_checkpoint(session)
+                self.sessions.save(session)
+                self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            finally:
+                exit_turn_generation_guard(_gen_token)
             options = ask_user_options_from_messages(all_msgs) if stop_reason == "ask_user" else []
             content, buttons = ask_user_outbound(
                 final_content or "Background task completed.",
@@ -1070,47 +1083,55 @@ class AgentLoop:
                 )
             )
 
-        # Persist the triggering user message up front so a mid-turn crash
-        # doesn't silently lose the prompt on recovery. ``media`` rides along
-        # as raw on-disk paths — sanitized image blocks are stripped from
-        # JSONL, and webui replay needs the paths to mint signed URLs.
-        user_persisted_early = False
-        media_paths = [p for p in (msg.media or []) if isinstance(p, str) and p]
-        has_text = isinstance(msg.content, str) and msg.content.strip()
-        if not pending_ask_id and (has_text or media_paths):
-            extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
-            text = msg.content if isinstance(msg.content, str) else ""
-            session.add_message("user", text, **extra)
-            self._mark_pending_user_turn(session)
+        # Capture session.generation before the long-running loop so that
+        # any concurrent /clear (in another async task) is detected by
+        # SessionManager.save and our late saves are dropped instead of
+        # resurrecting the cleared history on disk.
+        _gen_token = enter_turn_generation_guard(session)
+        try:
+            # Persist the triggering user message up front so a mid-turn crash
+            # doesn't silently lose the prompt on recovery. ``media`` rides along
+            # as raw on-disk paths — sanitized image blocks are stripped from
+            # JSONL, and webui replay needs the paths to mint signed URLs.
+            user_persisted_early = False
+            media_paths = [p for p in (msg.media or []) if isinstance(p, str) and p]
+            has_text = isinstance(msg.content, str) and msg.content.strip()
+            if not pending_ask_id and (has_text or media_paths):
+                extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
+                text = msg.content if isinstance(msg.content, str) else ""
+                session.add_message("user", text, **extra)
+                self._mark_pending_user_turn(session)
+                self.sessions.save(session)
+                user_persisted_early = True
+
+            final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                on_retry_wait=_on_retry_wait,
+                session=session,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+                metadata=msg.metadata,
+                session_key=key,
+                pending_queue=pending_queue,
+            )
+
+            if final_content is None or not final_content.strip():
+                final_content = EMPTY_FINAL_RESPONSE_MESSAGE
+
+            # Skip the already-persisted user message when saving the turn
+            save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
+            self._save_turn(session, all_msgs, save_skip)
+            session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
+            self._clear_pending_user_turn(session)
+            self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
-            user_persisted_early = True
-
-        final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            on_retry_wait=_on_retry_wait,
-            session=session,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-            metadata=msg.metadata,
-            session_key=key,
-            pending_queue=pending_queue,
-        )
-
-        if final_content is None or not final_content.strip():
-            final_content = EMPTY_FINAL_RESPONSE_MESSAGE
-
-        # Skip the already-persisted user message when saving the turn
-        save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
-        self._save_turn(session, all_msgs, save_skip)
-        session.enforce_file_cap(on_archive=self.context.memory.raw_archive)
-        self._clear_pending_user_turn(session)
-        self._clear_runtime_checkpoint(session)
-        self.sessions.save(session)
-        self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+        finally:
+            exit_turn_generation_guard(_gen_token)
 
         # When follow-up messages were injected mid-turn, a later natural
         # language reply may address those follow-ups and should not be
